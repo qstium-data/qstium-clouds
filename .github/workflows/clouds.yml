@@ -1,0 +1,86 @@
+# Карта облаков для модуля «Земля» QSTiUM: раз в час собирает маску и кладёт её в Cloudflare KV.
+# В публичном репозитории лежит как .github/workflows/clouds.yml, рядом в корне — build_mask.py, sources.py,
+# mosaic.py, nightfilter.py, cfkv.py, requirements.txt (копия tools/earth/clouds-pipeline из qst-app).
+# Секреты репозитория (Settings → Secrets and variables → Actions):
+#   CF_ACCOUNT_ID       — Account ID Cloudflare
+#   CF_API_TOKEN        — токен только с правом «Workers KV Storage: Edit»
+#   CF_KV_NAMESPACE_ID  — id пространства KV qstium-earth-clouds (того же, что привязан к воркеру)
+name: clouds
+
+on:
+  schedule:
+    - cron: '55 * * * *'       # GitHub часто запускает с опозданием на 5–20 мин — это нормально
+  workflow_dispatch:
+    inputs:
+      max_hours:
+        description: 'Сколько часов собрать за запуск (1–26; больше ~8 не успеет — бюджет 17 мин, запускать повторно)'
+        default: '4'
+      hour:
+        description: 'Пересобрать один час (ГГГГ-ММ-ДДTЧЧ), пусто — по манифесту'
+        default: ''
+
+permissions:
+  contents: read
+  actions: write               # только для шага «не дать выключить расписание»
+
+concurrency:
+  group: clouds
+  cancel-in-progress: false    # второй запуск ждёт первый, а не убивает его посреди записи в KV
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Зависимости
+        run: pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Сборка и запись в KV
+        env:
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CF_KV_NAMESPACE_ID: ${{ secrets.CF_KV_NAMESPACE_ID }}
+          PYTHONUNBUFFERED: '1'
+          # Входы — только через env и с проверкой формата: подставленные прямо в текст скрипта, они выполнились бы как команды
+          IN_MAX_HOURS: ${{ github.event.inputs.max_hours }}
+          IN_HOUR: ${{ github.event.inputs.hour }}
+        run: |
+          MAX_HOURS="${IN_MAX_HOURS:-4}"
+          if ! [[ "$MAX_HOURS" =~ ^[0-9]{1,2}$ ]] || [ "$MAX_HOURS" -lt 1 ] || [ "$MAX_HOURS" -gt 26 ]; then
+            echo "max_hours: нужно число 1..26"; exit 2
+          fi
+          ARGS=(--upload --sizes 2048,4096 --out-dir out --report out/run.json --budget-min 17 --max-hours "$MAX_HOURS")
+          if [ -n "$IN_HOUR" ]; then
+            if ! [[ "$IN_HOUR" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}$ ]]; then echo "hour: нужно ГГГГ-ММ-ДДTЧЧ"; exit 2; fi
+            ARGS+=(--hour "$IN_HOUR")
+          fi
+          python build_mask.py "${ARGS[@]}"
+
+      - name: Отчёт прогона
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-${{ github.run_id }}
+          path: out/run.json
+          retention-days: 3
+          if-no-files-found: ignore
+
+      # В публичном репозитории GitHub выключает расписание после 60 дней без коммитов.
+      # Раз в сутки (запуск около 00:55) повторно включаем свой workflow через API. Сбрасывает ли это счётчик,
+      # GitHub не обещает; надёжный запасной путь — пустой коммит раз в месяц.
+      - name: Не дать выключить расписание
+        if: github.event_name == 'schedule' && always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$(date -u +%H)" = "00" ] || [ "$(date -u +%H)" = "01" ]; then
+            gh api -X PUT "repos/${{ github.repository }}/actions/workflows/clouds.yml/enable" && echo 'расписание подтверждено'
+          fi

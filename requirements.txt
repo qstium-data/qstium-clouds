@@ -1,0 +1,10 @@
+# Проверено на Python 3.14 (как в workflow.yml). Колёса есть для Linux/Windows, сборка не нужна.
+numpy==2.5.4
+scipy==1.18.1
+h5py==3.16.0
+pillow==13.0.0
+requests==2.34.2
+urllib3==2.8.0
+certifi==2026.10.23
+charset-normalizer==3.5.2
+idna==3.20
